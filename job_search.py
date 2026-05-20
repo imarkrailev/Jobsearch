@@ -2,16 +2,54 @@
 """
 Job Search Tool — Mark Izrailev
 Sources: LinkedIn (guest API), Indeed (scrape), RemoteOK (public API)
-Output:  job_listings.json  +  console summary
+Output:  Google Sheets spreadsheet  (new rows only — preserves existing Status/Notes)
+
+── FIRST-TIME SETUP ────────────────────────────────────────────────────────────
+1. Go to https://console.cloud.google.com/
+2. Create a new project (or select an existing one)
+3. Enable APIs:  search "Google Sheets API" → Enable
+                 search "Google Drive API"  → Enable
+4. Create credentials:
+     Credentials → + Create Credentials → OAuth client ID
+     Application type: Desktop app  → Name it anything → Create
+5. Download the JSON → save it as  credentials.json  in this folder
+6. Run this script — a browser window will open once for authorization
+   After that, a token.json is saved and no browser is needed again.
+────────────────────────────────────────────────────────────────────────────────
 """
 
-import requests, json, re, time, sys
+import requests, json, re, time, sys, os
 from datetime import datetime
+from pathlib import Path
 from bs4 import BeautifulSoup
+
+import gspread
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
 
 # Fix Windows console encoding
 if sys.stdout.encoding != 'utf-8':
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+
+BASE_DIR      = Path(r"C:\Users\Mark\Jobsearch")
+CREDS_FILE    = BASE_DIR / "credentials.json"
+TOKEN_FILE    = BASE_DIR / "token.json"
+CONFIG_FILE   = BASE_DIR / "sheets_config.json"   # stores spreadsheet ID after first run
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+SHEET_TITLE = "Job Listings — Mark Izrailev"
+
+HEADERS_ROW = [
+    "#", "Date Found", "Title", "Company", "Location",
+    "Source", "Date Posted", "Link", "Status", "Notes",
+]
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -25,12 +63,9 @@ SEARCH_TERMS = [
     "Supply Chain Planner",
 ]
 
-DENVER_LOCATION  = "Denver, Colorado, United States"
-DENVER_RADIUS_MI = 50
+DENVER_LOCATION = "Denver, Colorado, United States"
 
-OUTPUT_FILE = r"C:\Users\Mark\Jobsearch\job_listings.json"
-
-HEADERS = {
+HTTP_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -39,24 +74,129 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-# ── LinkedIn guest job search ─────────────────────────────────────────────────
+# ── Google Sheets auth & setup ────────────────────────────────────────────────
 
-def linkedin_search(query, location="", remote=False, start=0):
-    """
-    LinkedIn's unauthenticated job listing endpoint.
-    Returns list of job dicts.
-    """
+def get_gspread_client():
+    if not CREDS_FILE.exists():
+        print("\n[ERROR] credentials.json not found.")
+        print("See setup instructions at the top of this file.")
+        sys.exit(1)
+
+    creds = None
+    if TOKEN_FILE.exists():
+        creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
+
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(str(CREDS_FILE), SCOPES)
+            creds = flow.run_local_server(port=0)
+        TOKEN_FILE.write_text(creds.to_json())
+
+    return gspread.authorize(creds)
+
+
+def get_or_create_sheet(client):
+    """Open existing spreadsheet by saved ID, or create a new one."""
+    spreadsheet_id = None
+    if CONFIG_FILE.exists():
+        cfg = json.loads(CONFIG_FILE.read_text())
+        spreadsheet_id = cfg.get("spreadsheet_id")
+
+    if spreadsheet_id:
+        try:
+            sh = client.open_by_key(spreadsheet_id)
+            print(f"  Opened existing sheet: {sh.url}")
+            return sh
+        except Exception:
+            print("  Saved sheet not found — creating a new one.")
+
+    # Create new spreadsheet
+    sh = client.create(SHEET_TITLE)
+    sh.share(None, perm_type="anyone", role="writer")  # makes URL shareable
+    CONFIG_FILE.write_text(json.dumps({"spreadsheet_id": sh.id}, indent=2))
+    print(f"  Created new sheet: {sh.url}")
+    return sh
+
+
+def init_worksheet(sh):
+    """Return the main worksheet, creating it with headers if needed."""
+    ws = sh.sheet1
+    ws.update_title("Listings")
+
+    existing = ws.get_all_values()
+    if not existing or existing[0] != HEADERS_ROW:
+        ws.clear()
+        ws.append_row(HEADERS_ROW, value_input_option="RAW")
+        # Format header row
+        ws.format("A1:J1", {
+            "textFormat": {"bold": True},
+            "backgroundColor": {"red": 0.2, "green": 0.2, "blue": 0.2},
+        })
+        # Set column widths
+        body = {"requests": [
+            {"updateDimensionProperties": {
+                "range": {"sheetId": ws.id, "dimension": "COLUMNS",
+                           "startIndex": i, "endIndex": i+1},
+                "properties": {"pixelSize": w},
+                "fields": "pixelSize",
+            }}
+            for i, w in enumerate([40, 100, 240, 180, 160, 90, 100, 400, 120, 200])
+        ]}
+        sh.batch_update(body)
+        # Freeze header row
+        sh.batch_update({"requests": [{"updateSheetProperties": {
+            "properties": {"sheetId": ws.id, "gridProperties": {"frozenRowCount": 1}},
+            "fields": "gridProperties.frozenRowCount",
+        }}]})
+
+    return ws
+
+
+def push_to_sheet(ws, new_jobs):
+    """Append only jobs whose links aren't already in the sheet."""
+    existing_rows = ws.get_all_values()
+    existing_links = {row[7] for row in existing_rows[1:] if len(row) > 7}
+
+    date_found = datetime.now().strftime("%Y-%m-%d")
+    rows_to_add = []
+    start_num = len(existing_rows)  # row counter continues from last row
+
+    for job in new_jobs:
+        link = job.get("link", "")
+        if link and link in existing_links:
+            continue
+        existing_links.add(link)
+        start_num += 1
+        rows_to_add.append([
+            start_num - 1,              # #
+            date_found,                 # Date Found
+            job.get("title", ""),       # Title
+            job.get("company", ""),     # Company
+            job.get("location", ""),    # Location
+            job.get("source", ""),      # Source
+            job.get("date", "")[:10] if job.get("date") else "",  # Date Posted
+            link,                       # Link
+            "",                         # Status (user fills in)
+            "",                         # Notes (user fills in)
+        ])
+
+    if rows_to_add:
+        ws.append_rows(rows_to_add, value_input_option="RAW")
+
+    return len(rows_to_add)
+
+
+# ── Job scrapers ──────────────────────────────────────────────────────────────
+
+def linkedin_search(query, location="", remote=False):
     base = "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
-    params = {
-        "keywords": query,
-        "location": location,
-        "start": start,
-        "f_WT": "2" if remote else "",   # f_WT=2 = Remote filter
-    }
+    params = {"keywords": query, "location": location, "start": 0, "f_WT": "2" if remote else ""}
     if remote:
         params["location"] = "United States"
     try:
-        r = requests.get(base, params=params, headers=HEADERS, timeout=12)
+        r = requests.get(base, params=params, headers=HTTP_HEADERS, timeout=12)
         if r.status_code != 200:
             return []
         soup = BeautifulSoup(r.text, "html.parser")
@@ -75,7 +215,6 @@ def linkedin_search(query, location="", remote=False, start=0):
                 "location":    loc_el.get_text(strip=True)     if loc_el     else location,
                 "link":        link_el["href"].split("?")[0]   if link_el    else "",
                 "date":        date_el.get("datetime", "")     if date_el    else "",
-                "description": "",
                 "source":      "LinkedIn",
                 "search_term": query,
             })
@@ -85,15 +224,12 @@ def linkedin_search(query, location="", remote=False, start=0):
         return []
 
 
-# ── Indeed scrape ─────────────────────────────────────────────────────────────
-
 def indeed_search(query, location="Denver, CO", remote=False):
-    """Scrape Indeed search results page."""
     q = query.replace(" ", "+")
     l = "remote" if remote else location.replace(" ", "+").replace(",", "%2C")
     url = f"https://www.indeed.com/jobs?q={q}&l={l}&radius=50&sort=date&fromage=30"
     try:
-        r = requests.get(url, headers=HEADERS, timeout=12)
+        r = requests.get(url, headers=HTTP_HEADERS, timeout=12)
         if r.status_code != 200:
             return []
         soup = BeautifulSoup(r.text, "html.parser")
@@ -110,13 +246,12 @@ def indeed_search(query, location="Denver, CO", remote=False):
             if href and not href.startswith("http"):
                 href = "https://www.indeed.com" + href
             jobs.append({
-                "title":       title_el.get_text(strip=True),
-                "company":     company_el.get_text(strip=True) if company_el else "",
-                "location":    loc_el.get_text(strip=True)     if loc_el     else location,
-                "link":        href,
-                "date":        date_el.get_text(strip=True)    if date_el    else "",
-                "description": "",
-                "source":      "Indeed",
+                "title":    title_el.get_text(strip=True),
+                "company":  company_el.get_text(strip=True) if company_el else "",
+                "location": loc_el.get_text(strip=True)     if loc_el     else location,
+                "link":     href,
+                "date":     date_el.get_text(strip=True)    if date_el    else "",
+                "source":   "Indeed",
                 "search_term": query,
             })
         return jobs
@@ -125,9 +260,6 @@ def indeed_search(query, location="Denver, CO", remote=False):
         return []
 
 
-# ── RemoteOK public API ───────────────────────────────────────────────────────
-
-# RemoteOK: title must contain at least one of these phrases to be included
 REMOTEOK_TITLE_PHRASES = [
     "demand plan", "supply plan", "inventory plan", "demand manager",
     "supply chain plan", "s&op", "replenishment", "forecast",
@@ -136,32 +268,26 @@ REMOTEOK_TITLE_PHRASES = [
 ]
 
 def remoteok_search():
-    """Pull all RemoteOK jobs and filter for supply chain relevance by title."""
     try:
         r = requests.get(
             "https://remoteok.com/api",
-            headers={**HEADERS, "Accept": "application/json"},
+            headers={**HTTP_HEADERS, "Accept": "application/json"},
             timeout=15,
         )
         r.raise_for_status()
-        data = r.json()
         jobs = []
-        for job in data:
+        for job in r.json():
             if not isinstance(job, dict) or "position" not in job:
                 continue
-            title_lower = job.get("position", "").lower()
-            if not any(phrase in title_lower for phrase in REMOTEOK_TITLE_PHRASES):
+            if not any(p in job.get("position", "").lower() for p in REMOTEOK_TITLE_PHRASES):
                 continue
-            desc = re.sub(r"<[^>]+>", " ", job.get("description", ""))
-            desc = re.sub(r"\s+", " ", desc).strip()[:300]
             jobs.append({
-                "title":       job.get("position", ""),
-                "company":     job.get("company", ""),
-                "location":    "Remote",
-                "link":        job.get("url", ""),
-                "date":        job.get("date", "")[:10] if job.get("date") else "",
-                "description": desc,
-                "source":      "RemoteOK",
+                "title":    job.get("position", ""),
+                "company":  job.get("company", ""),
+                "location": "Remote",
+                "link":     job.get("url", ""),
+                "date":     job.get("date", "")[:10] if job.get("date") else "",
+                "source":   "RemoteOK",
                 "search_term": "supply chain / demand planning",
             })
         return jobs
@@ -178,6 +304,7 @@ def main():
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"{'='*62}\n")
 
+    # ── Scrape ─────────────────────────────────────────────────────────────
     all_jobs   = []
     seen_links = set()
 
@@ -191,74 +318,48 @@ def main():
                 added += 1
         return added
 
-    # ── LinkedIn — Denver area ──────────────────────────────────────────────
     print("LinkedIn  •  Denver area (50 mi)")
     for term in SEARCH_TERMS:
-        jobs = linkedin_search(term, location=DENVER_LOCATION)
-        n    = add_jobs(jobs)
+        n = add_jobs(linkedin_search(term, location=DENVER_LOCATION))
         print(f"  {term:<30}  {n} new listings")
         time.sleep(0.8)
 
-    # ── LinkedIn — Remote ───────────────────────────────────────────────────
     print("\nLinkedIn  •  Remote (US)")
     for term in SEARCH_TERMS:
-        jobs = linkedin_search(term, remote=True)
-        n    = add_jobs(jobs)
+        n = add_jobs(linkedin_search(term, remote=True))
         print(f"  {term:<30}  {n} new listings")
         time.sleep(0.8)
 
-    # ── Indeed — Denver area ────────────────────────────────────────────────
     print("\nIndeed  •  Denver, CO (50 mi)")
     for term in SEARCH_TERMS:
-        jobs = indeed_search(term, location="Denver, CO")
-        n    = add_jobs(jobs)
+        n = add_jobs(indeed_search(term, location="Denver, CO"))
         print(f"  {term:<30}  {n} new listings")
         time.sleep(1.0)
 
-    # ── Indeed — Remote ─────────────────────────────────────────────────────
     print("\nIndeed  •  Remote")
     for term in SEARCH_TERMS:
-        jobs = indeed_search(term, remote=True)
-        n    = add_jobs(jobs)
+        n = add_jobs(indeed_search(term, remote=True))
         print(f"  {term:<30}  {n} new listings")
         time.sleep(1.0)
 
-    # ── RemoteOK ────────────────────────────────────────────────────────────
     print("\nRemoteOK  •  Remote")
-    jobs = remoteok_search()
-    n    = add_jobs(jobs)
+    n = add_jobs(remoteok_search())
     print(f"  Supply chain / demand planning roles: {n} new listings")
 
-    # ── Save ────────────────────────────────────────────────────────────────
-    output = {
-        "generated": datetime.now().isoformat(),
-        "total":     len(all_jobs),
-        "jobs":      all_jobs,
-    }
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-        json.dump(output, f, indent=2, ensure_ascii=False)
+    # ── Push to Google Sheets ───────────────────────────────────────────────
+    print(f"\n{'─'*62}")
+    print("  Connecting to Google Sheets...")
+    client = get_gspread_client()
+    sh     = get_or_create_sheet(client)
+    ws     = init_worksheet(sh)
+    added  = push_to_sheet(ws, all_jobs)
 
     # ── Summary ─────────────────────────────────────────────────────────────
     print(f"\n{'='*62}")
-    print(f"  TOTAL: {len(all_jobs)} unique listings  |  Saved → job_listings.json")
+    print(f"  Scraped: {len(all_jobs)} listings  |  New rows added to sheet: {added}")
+    print(f"  Sheet:   {sh.url}")
     print(f"{'='*62}\n")
 
-    by_source = {}
-    for j in all_jobs:
-        by_source.setdefault(j["source"], []).append(j)
-    for src, jobs in sorted(by_source.items()):
-        print(f"  {src:<12} {len(jobs)} listings")
-
-    print(f"\n{'─'*62}")
-    print("  ALL LISTINGS\n")
-    for i, j in enumerate(all_jobs, 1):
-        loc = j["location"] or "—"
-        dt  = j["date"][:10] if j["date"] else ""
-        print(f"  {i:>3}. {j['title']}")
-        print(f"       {j['company']}  |  {loc}  |  {dt}  |  [{j['source']}]")
-        if j["link"]:
-            print(f"       {j['link'][:80]}")
-        print()
 
 if __name__ == "__main__":
     main()
