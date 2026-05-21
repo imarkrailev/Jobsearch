@@ -20,6 +20,7 @@ import requests, json, re, time, sys
 from datetime import datetime
 from pathlib import Path
 from bs4 import BeautifulSoup
+from generate_resume import create_resume, make_headline, make_summary, output_path_for
 
 import gspread
 from google.oauth2 import service_account
@@ -42,9 +43,15 @@ SCOPES = [
 SHEET_TITLE = "Job Listings — Mark Izrailev"
 
 HEADERS_ROW = [
-    "#", "Date Found", "Title", "Company", "Location",
-    "Source", "Date Posted", "Link", "Status", "Notes",
+    "#", "Date Added", "Title", "Company", "Location",
+    "Source", "Date Posted", "Link", "Reviewed?", "Resume Created", "Status", "Notes",
 ]
+# Column indices (0-based in data rows)
+COL_LINK           = 7
+COL_REVIEWED       = 8
+COL_RESUME_CREATED = 9
+COL_STATUS         = 10
+COL_NOTES          = 11
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -114,48 +121,82 @@ def get_or_create_sheet(client):
     return sh
 
 
+def _add_checkboxes(sh, ws, start_row, end_row):
+    """Add checkbox data validation to the Reviewed? column for given rows (1-indexed)."""
+    if start_row > end_row:
+        return
+    sh.batch_update({"requests": [{
+        "setDataValidation": {
+            "range": {
+                "sheetId": ws.id,
+                "startRowIndex": start_row - 1,
+                "endRowIndex": end_row,
+                "startColumnIndex": COL_REVIEWED,
+                "endColumnIndex": COL_REVIEWED + 1,
+            },
+            "rule": {"condition": {"type": "BOOLEAN"}, "showCustomUi": True},
+        }
+    }]})
+
+
 def init_worksheet(sh):
-    """Return the main worksheet, creating it with headers if needed."""
+    """Return the main worksheet, migrating old column structure if needed."""
     ws = sh.sheet1
     ws.update_title("Listings")
-
     existing = ws.get_all_values()
-    if not existing or existing[0] != HEADERS_ROW:
-        ws.clear()
-        ws.append_row(HEADERS_ROW, value_input_option="RAW")
-        # Format header row
-        ws.format("A1:J1", {
-            "textFormat": {"bold": True},
-            "backgroundColor": {"red": 0.2, "green": 0.2, "blue": 0.2},
-        })
-        # Set column widths
-        body = {"requests": [
-            {"updateDimensionProperties": {
-                "range": {"sheetId": ws.id, "dimension": "COLUMNS",
-                           "startIndex": i, "endIndex": i+1},
-                "properties": {"pixelSize": w},
-                "fields": "pixelSize",
-            }}
-            for i, w in enumerate([40, 100, 240, 180, 160, 90, 100, 400, 120, 200])
-        ]}
-        sh.batch_update(body)
-        # Freeze header row
-        sh.batch_update({"requests": [{"updateSheetProperties": {
-            "properties": {"sheetId": ws.id, "gridProperties": {"frozenRowCount": 1}},
-            "fields": "gridProperties.frozenRowCount",
-        }}]})
 
+    if existing and existing[0] == HEADERS_ROW:
+        return ws  # already up to date
+
+    if existing and len(existing[0]) == 10 and existing[0][1] in ("Date Found", "Date Added"):
+        # Old 10-column structure — insert Reviewed? and Resume Created before Status
+        print("  Migrating sheet to new column structure...")
+        sh.batch_update({"requests": [{
+            "insertDimension": {
+                "range": {"sheetId": ws.id, "dimension": "COLUMNS",
+                          "startIndex": COL_REVIEWED, "endIndex": COL_REVIEWED + 2},
+                "inheritFromBefore": False,
+            }
+        }]})
+        ws.update_cell(1, COL_REVIEWED + 1, "Reviewed?")
+        ws.update_cell(1, COL_RESUME_CREATED + 1, "Resume Created")
+        ws.update_cell(1, 2, "Date Added")
+        num_data_rows = len(existing) - 1
+        if num_data_rows > 0:
+            _add_checkboxes(sh, ws, 2, num_data_rows + 1)
+        print("  Migration complete.")
+        return ws
+
+    # Fresh init
+    ws.clear()
+    ws.append_row(HEADERS_ROW, value_input_option="RAW")
+    ws.format("A1:L1", {
+        "textFormat": {"bold": True},
+        "backgroundColor": {"red": 0.18, "green": 0.18, "blue": 0.18},
+    })
+    col_widths = [40, 100, 240, 180, 160, 90, 100, 380, 90, 130, 120, 200]
+    sh.batch_update({"requests": [
+        {"updateDimensionProperties": {
+            "range": {"sheetId": ws.id, "dimension": "COLUMNS",
+                      "startIndex": i, "endIndex": i+1},
+            "properties": {"pixelSize": w}, "fields": "pixelSize",
+        }} for i, w in enumerate(col_widths)
+    ]})
+    sh.batch_update({"requests": [{"updateSheetProperties": {
+        "properties": {"sheetId": ws.id, "gridProperties": {"frozenRowCount": 1}},
+        "fields": "gridProperties.frozenRowCount",
+    }}]})
     return ws
 
 
-def push_to_sheet(ws, new_jobs):
-    """Append only jobs whose links aren't already in the sheet."""
+def push_to_sheet(ws, sh, new_jobs):
+    """Append only jobs not already in the sheet; add checkboxes to new rows."""
     existing_rows = ws.get_all_values()
-    existing_links = {row[7] for row in existing_rows[1:] if len(row) > 7}
+    existing_links = {row[COL_LINK] for row in existing_rows[1:] if len(row) > COL_LINK}
 
-    date_found = datetime.now().strftime("%Y-%m-%d")
+    date_added = datetime.now().strftime("%Y-%m-%d")
     rows_to_add = []
-    start_num = len(existing_rows)  # row counter continues from last row
+    start_num = len(existing_rows)
 
     for job in new_jobs:
         link = job.get("link", "")
@@ -164,22 +205,93 @@ def push_to_sheet(ws, new_jobs):
         existing_links.add(link)
         start_num += 1
         rows_to_add.append([
-            start_num - 1,              # #
-            date_found,                 # Date Found
-            job.get("title", ""),       # Title
-            job.get("company", ""),     # Company
-            job.get("location", ""),    # Location
-            job.get("source", ""),      # Source
-            job.get("date", "")[:10] if job.get("date") else "",  # Date Posted
-            link,                       # Link
-            "",                         # Status (user fills in)
-            "",                         # Notes (user fills in)
+            start_num - 1,
+            date_added,
+            job.get("title", ""),
+            job.get("company", ""),
+            job.get("location", ""),
+            job.get("source", ""),
+            job.get("date", "")[:10] if job.get("date") else "",
+            link,
+            False,   # Reviewed? checkbox (FALSE = unchecked)
+            "",      # Resume Created
+            "",      # Status
+            "",      # Notes
         ])
 
     if rows_to_add:
-        ws.append_rows(rows_to_add, value_input_option="RAW")
+        first_new_row = len(existing_rows) + 1
+        last_new_row  = first_new_row + len(rows_to_add) - 1
+        ws.append_rows(rows_to_add, value_input_option="USER_ENTERED")
+        _add_checkboxes(sh, ws, first_new_row, last_new_row)
 
     return len(rows_to_add)
+
+
+# ── LinkedIn job description fetcher ─────────────────────────────────────────
+
+def fetch_jd_text(url):
+    """Fetch job description text from a LinkedIn job URL."""
+    if not url or "linkedin.com" not in url:
+        return ""
+    try:
+        r = requests.get(url, headers=HTTP_HEADERS, timeout=12)
+        if r.status_code != 200:
+            return ""
+        soup = BeautifulSoup(r.text, "html.parser")
+        for sel in [
+            "div.show-more-less-html__markup",
+            "div.description__text",
+            "section.show-more-less-html",
+        ]:
+            el = soup.select_one(sel)
+            if el:
+                text = re.sub(r"\s+", " ", el.get_text(" ")).strip()
+                return text[:3000]
+    except Exception:
+        pass
+    return ""
+
+
+# ── Resume generation for reviewed rows ──────────────────────────────────────
+
+def generate_pending_resumes(ws, sh):
+    """Generate PDFs for rows where Reviewed?=TRUE and Resume Created is blank."""
+    rows = ws.get_all_values()
+    pending = []
+    for i, row in enumerate(rows[1:], start=2):   # i = 1-indexed sheet row
+        reviewed = str(row[COL_REVIEWED]).upper() if len(row) > COL_REVIEWED else ""
+        created  = row[COL_RESUME_CREATED] if len(row) > COL_RESUME_CREATED else ""
+        if reviewed == "TRUE" and not created.strip():
+            pending.append((i, row))
+
+    if not pending:
+        return 0
+
+    print(f"\n  Generating resumes for {len(pending)} reviewed listing(s)...")
+    count = 0
+    for sheet_row, row in pending:
+        title   = row[2] if len(row) > 2 else ""
+        company = row[3] if len(row) > 3 else ""
+        link    = row[COL_LINK] if len(row) > COL_LINK else ""
+
+        print(f"  → {title} at {company}")
+        jd_text  = fetch_jd_text(link)
+        headline = make_headline(title)
+        summary  = make_summary(title, company, jd_text)
+        out_path = output_path_for(company, title)
+
+        try:
+            create_resume(out_path, headline, summary)
+            filename = out_path.name
+            ws.update_cell(sheet_row, COL_RESUME_CREATED + 1, filename)
+            print(f"    Saved: {filename}")
+            count += 1
+        except Exception as e:
+            print(f"    [Error generating resume]: {e}")
+        time.sleep(0.5)
+
+    return count
 
 
 # ── Job scrapers ──────────────────────────────────────────────────────────────
@@ -343,14 +455,15 @@ def main():
     # ── Push to Google Sheets ───────────────────────────────────────────────
     print(f"\n{'─'*62}")
     print("  Connecting to Google Sheets...")
-    client = get_gspread_client()
-    sh     = get_or_create_sheet(client)
-    ws     = init_worksheet(sh)
-    added  = push_to_sheet(ws, all_jobs)
+    client   = get_gspread_client()
+    sh       = get_or_create_sheet(client)
+    ws       = init_worksheet(sh)
+    added    = push_to_sheet(ws, sh, all_jobs)
+    resumes  = generate_pending_resumes(ws, sh)
 
     # ── Summary ─────────────────────────────────────────────────────────────
     print(f"\n{'='*62}")
-    print(f"  Scraped: {len(all_jobs)} listings  |  New rows added to sheet: {added}")
+    print(f"  Scraped: {len(all_jobs)} listings  |  New rows added: {added}  |  Resumes generated: {resumes}")
     print(f"  Sheet:   {sh.url}")
     print(f"{'='*62}\n")
 
