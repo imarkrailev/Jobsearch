@@ -200,12 +200,30 @@ def make_summary(title, company, jd_text=""):
 
 
 def safe_filename(s):
+    import unicodedata
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
     s = re.sub(r"[^\w\s]", "", s)
     s = re.sub(r"\s+", "_", s.strip())
     return s[:40]
 
 
+def _clean_title(title, company):
+    """
+    Strip brand/company prefix from title.
+    Handles 'Smartwool: Senior Demand Planner' and 'Altra: Associate Demand Planner'
+    where the prefix before ':' overlaps with the company name.
+    """
+    if ":" in title:
+        prefix, rest = title.split(":", 1)
+        prefix_l  = prefix.strip().lower()
+        company_l = company.strip().lower()
+        # Strip if prefix is a substring of company name or vice versa
+        if prefix_l in company_l or company_l in prefix_l:
+            return rest.strip()
+    return title
+
 def output_path_for(company, title):
+    title = _clean_title(title, company)
     return TAILORED_DIR / f"Mark_Izrailev_Resume_{safe_filename(company)}_{safe_filename(title)}.pdf"
 
 
