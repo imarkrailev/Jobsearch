@@ -6,7 +6,7 @@ Import:   from generate_resume import create_resume, make_headline, make_summary
 Standalone: python generate_resume.py  (regenerates the Truewerk resume)
 """
 
-import os, re
+import os, re, json
 from pathlib import Path
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.units import inch
@@ -17,6 +17,149 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, HRFlowable, Table, 
 
 W, H = letter
 TAILORED_DIR = Path(r"C:\Users\Mark\Jobsearch\Tailored_Resumes")
+
+# ── Claude bullet tailoring ───────────────────────────────────────────────────
+
+# Default bullets (used as fallback and as input to Claude)
+DEFAULT_BULLETS = {
+    "viega_demand": [
+        "Own SKU-level demand forecasting for the company’s largest portfolio, consolidating historical demand, seasonality, and commercial inputs into a single consensus operating forecast",
+        "Lead monthly S&amp;OP demand reviews with Sales and Operations, clearly framing forecast risks, channel opportunities, and drivers of change",
+        "Improved forecast accuracy by ~10%, sustaining &gt;80% WAPE across portfolio; managed bias systematically to prevent over- and under-forecasting",
+        "Built anomaly detection model (standard deviation + kurtosis) to identify non-organic ordering behavior and prevent downstream supply distortion",
+    ],
+    "viega_supply": [
+        "Owned inventory strategy end-to-end, including safety stock, inventory targets, and replenishment logic",
+        "Built Power BI–driven statistical safety stock engine, reducing excess inventory by ~5%",
+        "Developed scalable inventory target framework integrating safety stock and lot-size logic",
+        "Ensured inventory positioning supported fulfillment performance and service levels",
+    ],
+    "forum_brands": [
+        "Planned and managed demand across 4 international markets and 7 fulfillment locations, supporting channel allocation across Amazon, DTC, and wholesale accounts",
+        "Maintained &lt;1% out-of-stock rate during peak demand and COVID disruption through pre-season forecasting and inventory positioning across channels",
+        "Led demand planning and launch of Amazon Canada, driving ~10% incremental revenue",
+        "Built SQL/Looker dashboards and automated reporting, improving forecast vs. actual visibility and decision speed",
+        "Automated shipment tracking processes, eliminating 15+ hours of manual work weekly",
+    ],
+}
+
+# Plain-text versions sent to Claude (no HTML entities)
+_PLAIN_BULLETS = {
+    "viega_demand": [
+        "Own SKU-level demand forecasting for the company's largest portfolio, consolidating historical demand, seasonality, and commercial inputs into a single consensus operating forecast",
+        "Lead monthly S&OP demand reviews with Sales and Operations, clearly framing forecast risks, channel opportunities, and drivers of change",
+        "Improved forecast accuracy by ~10%, sustaining >80% WAPE across portfolio; managed bias systematically to prevent over- and under-forecasting",
+        "Built anomaly detection model (standard deviation + kurtosis) to identify non-organic ordering behavior and prevent downstream supply distortion",
+    ],
+    "viega_supply": [
+        "Owned inventory strategy end-to-end, including safety stock, inventory targets, and replenishment logic",
+        "Built Power BI-driven statistical safety stock engine, reducing excess inventory by ~5%",
+        "Developed scalable inventory target framework integrating safety stock and lot-size logic",
+        "Ensured inventory positioning supported fulfillment performance and service levels",
+    ],
+    "forum_brands": [
+        "Planned and managed demand across 4 international markets and 7 fulfillment locations, supporting channel allocation across Amazon, DTC, and wholesale accounts",
+        "Maintained <1% out-of-stock rate during peak demand and COVID disruption through pre-season forecasting and inventory positioning across channels",
+        "Led demand planning and launch of Amazon Canada, driving ~10% incremental revenue",
+        "Built SQL/Looker dashboards and automated reporting, improving forecast vs. actual visibility and decision speed",
+        "Automated shipment tracking processes, eliminating 15+ hours of manual work weekly",
+    ],
+}
+
+def _load_api_key():
+    key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not key:
+        env_file = Path(r"C:\Users\Mark\Jobsearch\.env")
+        if env_file.exists():
+            for line in env_file.read_text().splitlines():
+                if line.startswith("ANTHROPIC_API_KEY="):
+                    key = line.split("=", 1)[1].strip()
+    return key
+
+def _html_escape(text):
+    return (text
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("’", "'")
+        .replace("–", "–"))
+
+def tailor_bullets(jd_text, title, company):
+    """
+    Use Claude to rewrite the 3 key role bullet sets to match the job description.
+    Returns dict with keys viega_demand, viega_supply, forum_brands.
+    Falls back to DEFAULT_BULLETS if API key is unavailable or call fails.
+    """
+    api_key = _load_api_key()
+    if not api_key:
+        print("    [No ANTHROPIC_API_KEY — using default bullets]")
+        return DEFAULT_BULLETS
+
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=api_key)
+
+        bullet_block = ""
+        for role, label in [
+            ("viega_demand",  "Viega LLC — Senior Demand Planner"),
+            ("viega_supply",  "Viega LLC — Senior Supply Planner"),
+            ("forum_brands",  "Forum Brands — Supply Chain Specialist"),
+        ]:
+            bullet_block += f"\n[{label}]\n"
+            for i, b in enumerate(_PLAIN_BULLETS[role], 1):
+                bullet_block += f"{i}. {b}\n"
+
+        prompt = f"""You are an elite executive resume writer for supply chain and demand planning roles.
+
+TARGET ROLE: {title} at {company}
+
+JOB DESCRIPTION:
+{jd_text[:3000]}
+
+CURRENT BULLETS TO REWRITE:
+{bullet_block}
+
+RULES:
+- Rewrite/reorder bullets to emphasize what this JD prioritizes most
+- Keep ALL existing metrics intact (%, $, numbers) — never fabricate new ones
+- Use strong action verbs: Optimized, Engineered, Spearheaded, Systematized, Formulated, Reconfigured, Negotiated
+- No weak language: facilitated, assisted, helped, supported, passionate, dynamic
+- Each bullet must be under 155 characters
+- Keep same bullet count per role: viega_demand=4, viega_supply=4, forum_brands=5
+- Return ONLY valid JSON, no explanation, no markdown
+
+JSON format:
+{{
+  "viega_demand": ["bullet1", "bullet2", "bullet3", "bullet4"],
+  "viega_supply": ["bullet1", "bullet2", "bullet3", "bullet4"],
+  "forum_brands": ["bullet1", "bullet2", "bullet3", "bullet4", "bullet5"]
+}}"""
+
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1200,
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+        raw = response.content[0].text.strip()
+        # Strip markdown code fences if present
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        data = json.loads(raw)
+
+        # Validate structure and escape HTML
+        result = {}
+        for key, count in [("viega_demand", 4), ("viega_supply", 4), ("forum_brands", 5)]:
+            bullets = data.get(key, [])
+            if len(bullets) < count:
+                bullets += _PLAIN_BULLETS[key][len(bullets):]
+            result[key] = [_html_escape(b) for b in bullets[:count]]
+
+        return result
+
+    except Exception as e:
+        print(f"    [Claude tailoring failed: {e} — using default bullets]")
+        return DEFAULT_BULLETS
 
 # ── Headline / summary generators ─────────────────────────────────────────────
 
@@ -68,7 +211,7 @@ def output_path_for(company, title):
 
 # ── PDF builder ────────────────────────────────────────────────────────────────
 
-def _build_story(f, headline, summary):
+def _build_story(f, headline, summary, bullets=None):
     LM = RM = 0.50 * inch
     CW = W - LM - RM
 
@@ -117,6 +260,8 @@ def _build_story(f, headline, summary):
     def b(text):
         return Paragraph(f"• {text}", S_bullet)
 
+    bl = bullets or DEFAULT_BULLETS
+
     story = []
 
     # Header
@@ -130,21 +275,11 @@ def _build_story(f, headline, summary):
 
     story += section("WORK EXPERIENCE")
 
-    story += [
-        job_row("Viega LLC — Senior Demand Planner", "June 2025 – Present | Broomfield, CO"),
-        b("Own SKU-level demand forecasting for the company’s largest portfolio, consolidating historical demand, seasonality, and commercial inputs into a single consensus operating forecast"),
-        b("Lead monthly S&amp;OP demand reviews with Sales and Operations, clearly framing forecast risks, channel opportunities, and drivers of change"),
-        b("Improved forecast accuracy by ~10%, sustaining &gt;80% WAPE across portfolio; managed bias systematically to prevent over- and under-forecasting"),
-        b("Built anomaly detection model (standard deviation + kurtosis) to identify non-organic ordering behavior and prevent downstream supply distortion"),
-    ]
+    story += [job_row("Viega LLC — Senior Demand Planner", "June 2025 – Present | Broomfield, CO")]
+    story += [b(bullet) for bullet in bl["viega_demand"]]
 
-    story += [
-        job_row("Viega LLC — Senior Supply Planner", "June 2024 – June 2025"),
-        b("Owned inventory strategy end-to-end, including safety stock, inventory targets, and replenishment logic"),
-        b("Built Power BI–driven statistical safety stock engine, reducing excess inventory by ~5%"),
-        b("Developed scalable inventory target framework integrating safety stock and lot-size logic"),
-        b("Ensured inventory positioning supported fulfillment performance and service levels"),
-    ]
+    story += [job_row("Viega LLC — Senior Supply Planner", "June 2024 – June 2025")]
+    story += [b(bullet) for bullet in bl["viega_supply"]]
 
     story += [
         job_row("MIGG Consulting / SupplyCaddy — Principal / Interim Director of Logistics", "Sept 2023 – June 2024 | Remote"),
@@ -155,14 +290,8 @@ def _build_story(f, headline, summary):
         b("Built processes to improve order accuracy and systematically resolve fulfillment issues"),
     ]
 
-    story += [
-        job_row("Forum Brands — Supply Chain Specialist", "Dec 2021 – Dec 2022 | New York, NY / Remote"),
-        b("Planned and managed demand across 4 international markets and 7 fulfillment locations, supporting channel allocation across Amazon, DTC, and wholesale accounts"),
-        b("Maintained &lt;1% out-of-stock rate during peak demand and COVID disruption through pre-season forecasting and inventory positioning across channels"),
-        b("Led demand planning and launch of Amazon Canada, driving ~10% incremental revenue"),
-        b("Built SQL/Looker dashboards and automated reporting, improving forecast vs. actual visibility and decision speed"),
-        b("Automated shipment tracking processes, eliminating 15+ hours of manual work weekly"),
-    ]
+    story += [job_row("Forum Brands — Supply Chain Specialist", "Dec 2021 – Dec 2022 | New York, NY / Remote")]
+    story += [b(bullet) for bullet in bl["forum_brands"]]
 
     story += [
         job_row("Unilever — Transportation Specialist", "Dec 2020 – Dec 2021 | Remote"),
@@ -210,10 +339,10 @@ def _build_story(f, headline, summary):
     return story
 
 
-def _build_to_file(path, f, headline, summary):
+def _build_to_file(path, f, headline, summary, bullets=None):
     LM = RM = 0.50 * inch
     TM = BM = (0.42 * f) * inch
-    story = _build_story(f, headline, summary)
+    story = _build_story(f, headline, summary, bullets)
     page_nums = []
     def track(canvas, doc):
         page_nums.append(canvas.getPageNumber())
@@ -223,9 +352,10 @@ def _build_to_file(path, f, headline, summary):
     return max(page_nums) if page_nums else 1
 
 
-def create_resume(output_path, headline, summary):
+def create_resume(output_path, headline, summary, bullets=None):
     """
     Generate a one-page tailored PDF resume.
+    bullets: dict with keys viega_demand, viega_supply, forum_brands (from tailor_bullets()).
     Binary-searches for the largest scale factor that still fits on one page.
     Returns output_path.
     """
@@ -235,13 +365,13 @@ def create_resume(output_path, headline, summary):
     lo, hi = 1.0, 1.40
     for _ in range(14):
         mid = (lo + hi) / 2
-        pages = _build_to_file(temp_path, mid, headline, summary)
+        pages = _build_to_file(temp_path, mid, headline, summary, bullets)
         if pages == 1:
             lo = mid
         else:
             hi = mid
 
-    _build_to_file(output_path, lo, headline, summary)
+    _build_to_file(output_path, lo, headline, summary, bullets)
     if os.path.exists(temp_path):
         os.remove(temp_path)
     return output_path

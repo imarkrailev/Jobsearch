@@ -20,7 +20,7 @@ import requests, json, re, time, sys
 from datetime import datetime
 from pathlib import Path
 from bs4 import BeautifulSoup
-from generate_resume import create_resume, make_headline, make_summary, output_path_for
+from generate_resume import create_resume, make_headline, make_summary, output_path_for, tailor_bullets
 
 import gspread
 from google.oauth2 import service_account
@@ -279,10 +279,11 @@ def generate_pending_resumes(ws, sh):
         jd_text  = fetch_jd_text(link)
         headline = make_headline(title)
         summary  = make_summary(title, company, jd_text)
+        bullets  = tailor_bullets(jd_text, title, company)
         out_path = output_path_for(company, title)
 
         try:
-            create_resume(out_path, headline, summary)
+            create_resume(out_path, headline, summary, bullets)
             filename = out_path.name
             ws.update_cell(sheet_row, COL_RESUME_CREATED + 1, filename)
             print(f"    Saved: {filename}")
