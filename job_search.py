@@ -9,24 +9,20 @@ Output:  Google Sheets spreadsheet  (new rows only — preserves existing Status
 2. Create a new project (or select an existing one)
 3. Enable APIs:  search "Google Sheets API" → Enable
                  search "Google Drive API"  → Enable
-4. Create credentials:
-     Credentials → + Create Credentials → OAuth client ID
-     Application type: Desktop app  → Name it anything → Create
-5. Download the JSON → save it as  credentials.json  in this folder
-6. Run this script — a browser window will open once for authorization
-   After that, a token.json is saved and no browser is needed again.
+4. IAM & Admin → Service Accounts → + Create Service Account → name it → Done
+5. Click the service account → Keys tab → Add Key → Create new key → JSON
+6. Save the downloaded file as  service_account.json  in this folder
+7. Run this script — no browser needed, works every time automatically.
 ────────────────────────────────────────────────────────────────────────────────
 """
 
-import requests, json, re, time, sys, os
+import requests, json, re, time, sys
 from datetime import datetime
 from pathlib import Path
 from bs4 import BeautifulSoup
 
 import gspread
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
+from google.oauth2 import service_account
 
 # Fix Windows console encoding
 if sys.stdout.encoding != 'utf-8':
@@ -34,10 +30,9 @@ if sys.stdout.encoding != 'utf-8':
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
-BASE_DIR      = Path(r"C:\Users\Mark\Jobsearch")
-CREDS_FILE    = BASE_DIR / "credentials.json"
-TOKEN_FILE    = BASE_DIR / "token.json"
-CONFIG_FILE   = BASE_DIR / "sheets_config.json"   # stores spreadsheet ID after first run
+BASE_DIR    = Path(r"C:\Users\Mark\Jobsearch")
+SA_FILE     = BASE_DIR / "service_account.json"
+CONFIG_FILE = BASE_DIR / "sheets_config.json"
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -77,46 +72,45 @@ HTTP_HEADERS = {
 # ── Google Sheets auth & setup ────────────────────────────────────────────────
 
 def get_gspread_client():
-    if not CREDS_FILE.exists():
-        print("\n[ERROR] credentials.json not found.")
+    if not SA_FILE.exists():
+        print("\n[ERROR] service_account.json not found.")
         print("See setup instructions at the top of this file.")
         sys.exit(1)
-
-    creds = None
-    if TOKEN_FILE.exists():
-        creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
-
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(str(CREDS_FILE), SCOPES)
-            creds = flow.run_local_server(port=0)
-        TOKEN_FILE.write_text(creds.to_json())
-
+    creds = service_account.Credentials.from_service_account_file(str(SA_FILE), scopes=SCOPES)
     return gspread.authorize(creds)
 
 
+def get_service_account_email():
+    return json.loads(SA_FILE.read_text()).get("client_email", "")
+
 def get_or_create_sheet(client):
-    """Open existing spreadsheet by saved ID, or create a new one."""
-    spreadsheet_id = None
+    """Open spreadsheet by saved ID, or prompt user to create and share one."""
     if CONFIG_FILE.exists():
         cfg = json.loads(CONFIG_FILE.read_text())
         spreadsheet_id = cfg.get("spreadsheet_id")
+        if spreadsheet_id:
+            try:
+                sh = client.open_by_key(spreadsheet_id)
+                print(f"  Opened sheet: {sh.url}")
+                return sh
+            except Exception as e:
+                print(f"  Could not open sheet: {e}")
 
-    if spreadsheet_id:
-        try:
-            sh = client.open_by_key(spreadsheet_id)
-            print(f"  Opened existing sheet: {sh.url}")
-            return sh
-        except Exception:
-            print("  Saved sheet not found — creating a new one.")
+    sa_email = get_service_account_email()
+    print(f"""
+  [SETUP REQUIRED — one time only]
+  1. Go to https://sheets.google.com and create a blank spreadsheet
+     Name it: Job Listings — Mark Izrailev
+  2. Click Share → paste this email → set role to Editor → Send:
+     {sa_email}
+  3. Copy the spreadsheet ID from the URL:
+     https://docs.google.com/spreadsheets/d/  SPREADSHEET_ID  /edit
+  4. Paste it here:""")
 
-    # Create new spreadsheet
-    sh = client.create(SHEET_TITLE)
-    sh.share(None, perm_type="anyone", role="writer")  # makes URL shareable
-    CONFIG_FILE.write_text(json.dumps({"spreadsheet_id": sh.id}, indent=2))
-    print(f"  Created new sheet: {sh.url}")
+    spreadsheet_id = input("  Spreadsheet ID: ").strip()
+    CONFIG_FILE.write_text(json.dumps({"spreadsheet_id": spreadsheet_id}, indent=2))
+    sh = client.open_by_key(spreadsheet_id)
+    print(f"  Connected: {sh.url}")
     return sh
 
 
