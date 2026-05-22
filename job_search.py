@@ -16,14 +16,27 @@ Output:  Google Sheets spreadsheet  (new rows only — preserves existing Status
 ────────────────────────────────────────────────────────────────────────────────
 """
 
-import requests, json, re, time, sys
+import requests, json, re, time, sys, os, webbrowser, argparse
+import datetime as dt
 from datetime import datetime
 from pathlib import Path
 from bs4 import BeautifulSoup
-from generate_resume import create_resume, make_headline, make_summary, output_path_for, tailor_bullets
+from generate_resume import create_resume, make_headline, make_summary, output_path_for, tailor_bullets, TAILORED_DIR
 
 import gspread
 from google.oauth2 import service_account
+
+try:
+    import pyperclip
+    _CLIPBOARD = True
+except ImportError:
+    _CLIPBOARD = False
+
+try:
+    import anthropic as _anthropic
+    _ANTHROPIC = True
+except ImportError:
+    _ANTHROPIC = False
 
 # Fix Windows console encoding
 if sys.stdout.encoding != 'utf-8':
@@ -45,6 +58,7 @@ SHEET_TITLE = "Job Listings — Mark Izrailev"
 HEADERS_ROW = [
     "#", "Date Added", "Title", "Company", "Location",
     "Source", "Date Posted", "Link", "Reviewed?", "Resume Created", "Status", "Notes",
+    "Applied?", "Date Applied", "Cover Letter",
 ]
 # Column indices (0-based in data rows)
 COL_LINK           = 7
@@ -52,6 +66,9 @@ COL_REVIEWED       = 8
 COL_RESUME_CREATED = 9
 COL_STATUS         = 10
 COL_NOTES          = 11
+COL_APPLIED        = 12
+COL_DATE_APPLIED   = 13
+COL_COVER_LETTER   = 14
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -122,21 +139,24 @@ def get_or_create_sheet(client):
 
 
 def _add_checkboxes(sh, ws, start_row, end_row):
-    """Add checkbox data validation to the Reviewed? column for given rows (1-indexed)."""
+    """Add checkbox data validation to Reviewed? and Applied? columns for given rows (1-indexed)."""
     if start_row > end_row:
         return
-    sh.batch_update({"requests": [{
-        "setDataValidation": {
-            "range": {
-                "sheetId": ws.id,
-                "startRowIndex": start_row - 1,
-                "endRowIndex": end_row,
-                "startColumnIndex": COL_REVIEWED,
-                "endColumnIndex": COL_REVIEWED + 1,
-            },
-            "rule": {"condition": {"type": "BOOLEAN"}, "showCustomUi": True},
+    sh.batch_update({"requests": [
+        {
+            "setDataValidation": {
+                "range": {
+                    "sheetId": ws.id,
+                    "startRowIndex": start_row - 1,
+                    "endRowIndex": end_row,
+                    "startColumnIndex": col,
+                    "endColumnIndex": col + 1,
+                },
+                "rule": {"condition": {"type": "BOOLEAN"}, "showCustomUi": True},
+            }
         }
-    }]})
+        for col in (COL_REVIEWED, COL_APPLIED)
+    ]})
 
 
 def init_worksheet(sh):
@@ -147,6 +167,23 @@ def init_worksheet(sh):
 
     if existing and existing[0] == HEADERS_ROW:
         return ws  # already up to date
+
+    if existing and len(existing[0]) == 12 and existing[0][12 - 1] == "Notes":
+        # 12-column structure — append Applied?, Date Applied, Cover Letter
+        print("  Migrating sheet: adding Applied?, Date Applied, Cover Letter columns...")
+        sh.batch_update({"requests": [{
+            "appendDimension": {
+                "sheetId": ws.id, "dimension": "COLUMNS", "length": 3,
+            }
+        }]})
+        ws.update_cell(1, COL_APPLIED + 1,      "Applied?")
+        ws.update_cell(1, COL_DATE_APPLIED + 1, "Date Applied")
+        ws.update_cell(1, COL_COVER_LETTER + 1, "Cover Letter")
+        num_data_rows = len(existing) - 1
+        if num_data_rows > 0:
+            _add_checkboxes(sh, ws, 2, num_data_rows + 1)
+        print("  Migration complete.")
+        return ws
 
     if existing and len(existing[0]) == 10 and existing[0][1] in ("Date Found", "Date Added"):
         # Old 10-column structure — insert Reviewed? and Resume Created before Status
@@ -170,11 +207,11 @@ def init_worksheet(sh):
     # Fresh init
     ws.clear()
     ws.append_row(HEADERS_ROW, value_input_option="RAW")
-    ws.format("A1:L1", {
+    ws.format("A1:O1", {
         "textFormat": {"bold": True},
         "backgroundColor": {"red": 0.18, "green": 0.18, "blue": 0.18},
     })
-    col_widths = [40, 100, 240, 180, 160, 90, 100, 380, 90, 130, 120, 200]
+    col_widths = [40, 100, 240, 180, 160, 90, 100, 380, 90, 130, 120, 200, 90, 110, 400]
     sh.batch_update({"requests": [
         {"updateDimensionProperties": {
             "range": {"sheetId": ws.id, "dimension": "COLUMNS",
@@ -213,10 +250,13 @@ def push_to_sheet(ws, sh, new_jobs):
             job.get("source", ""),
             job.get("date", "")[:10] if job.get("date") else "",
             link,
-            False,   # Reviewed? checkbox (FALSE = unchecked)
+            False,   # Reviewed?
             "",      # Resume Created
             "",      # Status
             "",      # Notes
+            False,   # Applied?
+            "",      # Date Applied
+            "",      # Cover Letter
         ])
 
     if rows_to_add:
@@ -291,6 +331,135 @@ def generate_pending_resumes(ws, sh):
         except Exception as e:
             print(f"    [Error generating resume]: {e}")
         time.sleep(0.5)
+
+    return count
+
+
+# ── Cover letter generation & application launcher ────────────────────────────
+
+def _load_api_key():
+    key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not key:
+        env_file = BASE_DIR / ".env"
+        if env_file.exists():
+            for line in env_file.read_text().splitlines():
+                if line.startswith("ANTHROPIC_API_KEY="):
+                    key = line.split("=", 1)[1].strip()
+    return key
+
+
+def generate_cover_letter(jd_text, title, company):
+    """Generate a targeted 3-paragraph cover letter via Claude API."""
+    if not _ANTHROPIC:
+        return ""
+    api_key = _load_api_key()
+    if not api_key:
+        return ""
+    client = _anthropic.Anthropic(api_key=api_key)
+    prompt = f"""You are an elite executive career coach writing a cover letter for Mark Izrailev, a senior supply chain and demand planning professional based in Highlands Ranch, CO.
+
+Role: {title} at {company}
+
+Job Description:
+{jd_text[:3000]}
+
+Write a concise, high-impact 3-paragraph cover letter (150–200 words total).
+- Paragraph 1: Open with a specific metric or achievement that directly addresses the company's most pressing operational need visible in the JD.
+- Paragraph 2: Two or three concrete examples drawn from experience (Viega, Forum Brands) that map to the role's stated priorities. Quantify everything possible.
+- Paragraph 3: Direct, confident close — no fluff. State availability and conviction.
+
+Rules: Strong operational verbs only. Zero filler phrases ("I am passionate about", "dynamic", "synergy"). Output only the letter body — no salutation, no signature."""
+    try:
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=500,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return response.content[0].text.strip()
+    except Exception as e:
+        print(f"    [Cover letter generation failed]: {e}")
+        return ""
+
+
+def apply_pending_jobs(ws, sh):
+    """Interactive launcher: for each job with a resume but not yet applied,
+    generate a cover letter, open the job URL, copy resume path to clipboard,
+    then mark Applied + Date Applied on confirmation."""
+    rows = ws.get_all_values()
+    pending = []
+    for i, row in enumerate(rows[1:], start=2):
+        resume_created = row[COL_RESUME_CREATED] if len(row) > COL_RESUME_CREATED else ""
+        applied        = str(row[COL_APPLIED]).upper() if len(row) > COL_APPLIED else ""
+        if resume_created.strip() and applied not in ("TRUE",):
+            pending.append((i, row))
+
+    if not pending:
+        print("  No pending applications (all reviewed jobs already applied or no resumes generated yet).")
+        return 0
+
+    print(f"\n  {len(pending)} job(s) queued for application.\n")
+    count = 0
+    for sheet_row, row in pending:
+        title   = row[2]   if len(row) > 2              else ""
+        company = row[3]   if len(row) > 3              else ""
+        link    = row[COL_LINK] if len(row) > COL_LINK  else ""
+        resume_file = row[COL_RESUME_CREATED]
+        resume_path = TAILORED_DIR / resume_file
+
+        print(f"  ┌─ {title} @ {company}")
+        print(f"  │  Resume: {resume_file}")
+
+        # Cover letter — generate if not already stored
+        cover = row[COL_COVER_LETTER].strip() if len(row) > COL_COVER_LETTER else ""
+        if not cover:
+            print("  │  Generating cover letter...", end=" ", flush=True)
+            jd_text = fetch_jd_text(link)
+            cover   = generate_cover_letter(jd_text, title, company)
+            if cover:
+                ws.update_cell(sheet_row, COL_COVER_LETTER + 1, cover)
+                print("done.")
+            else:
+                print("skipped (API unavailable).")
+        else:
+            print("  │  Cover letter: already on file.")
+
+        # Print cover letter preview
+        if cover:
+            preview = cover[:300] + ("…" if len(cover) > 300 else "")
+            print(f"  │\n  │  {preview.replace(chr(10), chr(10) + '  │  ')}\n  │")
+
+        # Copy resume path to clipboard
+        if _CLIPBOARD:
+            try:
+                pyperclip.copy(str(resume_path))
+                print(f"  │  Clipboard: resume path copied.")
+            except Exception:
+                print(f"  │  Clipboard unavailable — path: {resume_path}")
+        else:
+            print(f"  │  Resume path: {resume_path}")
+
+        # Open job URL
+        if link:
+            webbrowser.open(link)
+            print(f"  │  Opened job URL in browser.")
+
+        # Confirm
+        try:
+            answer = input("  └─ Mark as applied? [y / n / q=quit] → ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+
+        if answer == "q":
+            break
+        elif answer == "y":
+            today = dt.date.today().isoformat()
+            ws.update_cell(sheet_row, COL_APPLIED + 1,      True)
+            ws.update_cell(sheet_row, COL_DATE_APPLIED + 1, today)
+            print(f"  ✓  Applied — recorded {today}\n")
+            count += 1
+        else:
+            print("  –  Skipped.\n")
 
     return count
 
@@ -406,10 +575,29 @@ def remoteok_search():
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    parser = argparse.ArgumentParser(description="Job search pipeline — Mark Izrailev")
+    parser.add_argument(
+        "--apply", action="store_true",
+        help="Skip scraping; launch interactive application workflow for reviewed jobs with resumes.",
+    )
+    args = parser.parse_args()
+
     print(f"\n{'='*62}")
     print("  JOB SEARCH — Mark Izrailev  |  Supply Chain / Demand Planning")
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"{'='*62}\n")
+
+    if args.apply:
+        print("  Mode: Application Launcher\n")
+        client  = get_gspread_client()
+        sh      = get_or_create_sheet(client)
+        ws      = init_worksheet(sh)
+        applied = apply_pending_jobs(ws, sh)
+        print(f"\n{'='*62}")
+        print(f"  Applications recorded this session: {applied}")
+        print(f"  Sheet: {sh.url}")
+        print(f"{'='*62}\n")
+        return
 
     # ── Scrape ─────────────────────────────────────────────────────────────
     all_jobs   = []
