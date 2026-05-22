@@ -431,9 +431,15 @@ def main():
         print(f"  {term:<30}  {n} new listings")
         time.sleep(0.8)
 
-    print("\nLinkedIn  •  Remote (US)")
+    print("\nLinkedIn  •  Remote (US, f_WT=2 filter)")
     for term in SEARCH_TERMS:
         n = add_jobs(linkedin_search(term, remote=True))
+        print(f"  {term:<30}  {n} new listings")
+        time.sleep(0.8)
+
+    print("\nLinkedIn  •  Remote (keyword, no location filter)")
+    for term in SEARCH_TERMS:
+        n = add_jobs(linkedin_search(term + " remote", location=""))
         print(f"  {term:<30}  {n} new listings")
         time.sleep(0.8)
 
