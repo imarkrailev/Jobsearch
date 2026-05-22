@@ -57,18 +57,19 @@ SHEET_TITLE = "Job Listings — Mark Izrailev"
 
 HEADERS_ROW = [
     "#", "Date Added", "Title", "Company", "Location",
-    "Source", "Date Posted", "Link", "Reviewed?", "Resume Created", "Status", "Notes",
+    "Source", "Date Posted", "Salary", "Link", "Reviewed?", "Resume Created", "Status", "Notes",
     "Applied?", "Date Applied", "Cover Letter",
 ]
 # Column indices (0-based in data rows)
-COL_LINK           = 7
-COL_REVIEWED       = 8
-COL_RESUME_CREATED = 9
-COL_STATUS         = 10
-COL_NOTES          = 11
-COL_APPLIED        = 12
-COL_DATE_APPLIED   = 13
-COL_COVER_LETTER   = 14
+COL_SALARY         = 7
+COL_LINK           = 8
+COL_REVIEWED       = 9
+COL_RESUME_CREATED = 10
+COL_STATUS         = 11
+COL_NOTES          = 12
+COL_APPLIED        = 13
+COL_DATE_APPLIED   = 14
+COL_COVER_LETTER   = 15
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -168,6 +169,20 @@ def init_worksheet(sh):
     if existing and existing[0] == HEADERS_ROW:
         return ws  # already up to date
 
+    if existing and len(existing[0]) == 15 and existing[0][14] == "Cover Letter":
+        # 15-column structure — insert Salary between Date Posted and Link
+        print("  Migrating sheet: adding Salary column...")
+        sh.batch_update({"requests": [{
+            "insertDimension": {
+                "range": {"sheetId": ws.id, "dimension": "COLUMNS",
+                          "startIndex": 7, "endIndex": 8},
+                "inheritFromBefore": False,
+            }
+        }]})
+        ws.update_cell(1, 8, "Salary")
+        print("  Migration complete.")
+        return ws
+
     if existing and len(existing[0]) == 12 and existing[0][12 - 1] == "Notes":
         # 12-column structure — append Applied?, Date Applied, Cover Letter
         print("  Migrating sheet: adding Applied?, Date Applied, Cover Letter columns...")
@@ -207,11 +222,11 @@ def init_worksheet(sh):
     # Fresh init
     ws.clear()
     ws.append_row(HEADERS_ROW, value_input_option="RAW")
-    ws.format("A1:O1", {
+    ws.format("A1:P1", {
         "textFormat": {"bold": True},
         "backgroundColor": {"red": 0.18, "green": 0.18, "blue": 0.18},
     })
-    col_widths = [40, 100, 240, 180, 160, 90, 100, 380, 90, 130, 120, 200, 90, 110, 400]
+    col_widths = [40, 100, 240, 180, 160, 90, 100, 120, 380, 90, 130, 120, 200, 90, 110, 400]
     sh.batch_update({"requests": [
         {"updateDimensionProperties": {
             "range": {"sheetId": ws.id, "dimension": "COLUMNS",
@@ -249,6 +264,7 @@ def push_to_sheet(ws, sh, new_jobs):
             job.get("location", ""),
             job.get("source", ""),
             job.get("date", "")[:10] if job.get("date") else "",
+            job.get("salary", ""),   # Salary
             link,
             False,   # Reviewed?
             "",      # Resume Created
@@ -483,6 +499,7 @@ def linkedin_search(query, location="", remote=False):
             loc_el     = card.select_one(".job-search-card__location")
             link_el    = card.select_one("a.base-card__full-link")
             date_el    = card.select_one("time")
+            salary_el  = card.select_one(".job-search-card__salary-info")
             if not title_el:
                 continue
             jobs.append({
@@ -491,6 +508,7 @@ def linkedin_search(query, location="", remote=False):
                 "location":    loc_el.get_text(strip=True)     if loc_el     else location,
                 "link":        link_el["href"].split("?")[0]   if link_el    else "",
                 "date":        date_el.get("datetime", "")     if date_el    else "",
+                "salary":      re.sub(r"\s+", " ", salary_el.get_text(strip=True)) if salary_el else "",
                 "source":      "LinkedIn",
                 "search_term": query,
             })
@@ -516,6 +534,7 @@ def indeed_search(query, location="Denver, CO", remote=False):
             loc_el     = card.select_one("[data-testid='text-location'], .companyLocation")
             link_el    = card.select_one("h2.jobTitle a")
             date_el    = card.select_one("[data-testid='myJobsStateDate'], .date")
+            salary_el  = card.select_one("[data-testid='attribute_snippet_testid'], .salary-snippet-container, .estimated-salary")
             if not title_el:
                 continue
             href = link_el["href"] if link_el else ""
@@ -527,6 +546,7 @@ def indeed_search(query, location="Denver, CO", remote=False):
                 "location": loc_el.get_text(strip=True)     if loc_el     else location,
                 "link":     href,
                 "date":     date_el.get_text(strip=True)    if date_el    else "",
+                "salary":   re.sub(r"\s+", " ", salary_el.get_text(strip=True)) if salary_el else "",
                 "source":   "Indeed",
                 "search_term": query,
             })
@@ -557,12 +577,21 @@ def remoteok_search():
                 continue
             if not any(p in job.get("position", "").lower() for p in REMOTEOK_TITLE_PHRASES):
                 continue
+            s_min = job.get("salary_min")
+            s_max = job.get("salary_max")
+            if s_min and s_max:
+                salary = f"${int(s_min)//1000}k – ${int(s_max)//1000}k"
+            elif s_min:
+                salary = f"${int(s_min)//1000}k+"
+            else:
+                salary = ""
             jobs.append({
                 "title":    job.get("position", ""),
                 "company":  job.get("company", ""),
                 "location": "Remote",
                 "link":     job.get("url", ""),
                 "date":     job.get("date", "")[:10] if job.get("date") else "",
+                "salary":   salary,
                 "source":   "RemoteOK",
                 "search_term": "supply chain / demand planning",
             })
