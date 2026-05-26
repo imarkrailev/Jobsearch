@@ -16,8 +16,7 @@ Output:  Google Sheets spreadsheet  (new rows only — preserves existing Status
 ────────────────────────────────────────────────────────────────────────────────
 """
 
-import requests, json, re, time, sys, os, webbrowser, argparse, subprocess
-import datetime as dt
+import requests, json, re, time, sys, os
 from datetime import datetime
 from pathlib import Path
 from bs4 import BeautifulSoup
@@ -25,12 +24,6 @@ from generate_resume import create_resume, make_headline, make_summary, output_p
 
 import gspread
 from google.oauth2 import service_account
-
-try:
-    import pyperclip
-    _CLIPBOARD = True
-except ImportError:
-    _CLIPBOARD = False
 
 try:
     import anthropic as _anthropic
@@ -309,46 +302,69 @@ def fetch_jd_text(url):
     return ""
 
 
-# ── Resume generation for reviewed rows ──────────────────────────────────────
+# ── Resume + cover letter generation for reviewed rows ────────────────────────
 
 def generate_pending_resumes(ws, sh):
-    """Generate PDFs for rows where Reviewed?=TRUE and Resume Created is blank."""
+    """For Reviewed?=TRUE rows: generate PDF resume and write cover letter to sheet."""
     rows = ws.get_all_values()
-    pending = []
-    for i, row in enumerate(rows[1:], start=2):   # i = 1-indexed sheet row
-        reviewed = str(row[COL_REVIEWED]).upper() if len(row) > COL_REVIEWED else ""
-        created  = row[COL_RESUME_CREATED] if len(row) > COL_RESUME_CREATED else ""
-        if reviewed == "TRUE" and not created.strip():
-            pending.append((i, row))
+    resume_pending = []
+    cover_pending  = []
 
-    if not pending:
-        return 0
+    for i, row in enumerate(rows[1:], start=2):
+        if str(row[COL_REVIEWED] if len(row) > COL_REVIEWED else "").upper() != "TRUE":
+            continue
+        created = row[COL_RESUME_CREATED] if len(row) > COL_RESUME_CREATED else ""
+        cover   = row[COL_COVER_LETTER]   if len(row) > COL_COVER_LETTER   else ""
+        if not created.strip():
+            resume_pending.append((i, row))
+        elif not cover.strip():
+            cover_pending.append((i, row))
 
-    print(f"\n  Generating resumes for {len(pending)} reviewed listing(s)...")
-    count = 0
-    for sheet_row, row in pending:
-        title   = row[2] if len(row) > 2 else ""
-        company = row[3] if len(row) > 3 else ""
-        link    = row[COL_LINK] if len(row) > COL_LINK else ""
+    resumes_done = 0
+    covers_done  = 0
 
-        print(f"  → {title} at {company}")
-        jd_text  = fetch_jd_text(link)
-        headline = make_headline(title)
-        summary  = make_summary(title, company, jd_text)
-        bullets  = tailor_bullets(jd_text, title, company)
-        out_path = output_path_for(company, title)
+    if resume_pending:
+        print(f"\n  Generating resumes + cover letters for {len(resume_pending)} listing(s)...")
+        for sheet_row, row in resume_pending:
+            title   = row[2] if len(row) > 2 else ""
+            company = row[3] if len(row) > 3 else ""
+            link    = row[COL_LINK] if len(row) > COL_LINK else ""
+            print(f"  → {title} at {company}")
+            jd_text  = fetch_jd_text(link)
+            headline = make_headline(title)
+            summary  = make_summary(title, company, jd_text)
+            bullets  = tailor_bullets(jd_text, title, company)
+            out_path = output_path_for(company, title)
+            try:
+                create_resume(out_path, headline, summary, bullets)
+                ws.update_cell(sheet_row, COL_RESUME_CREATED + 1, out_path.name)
+                print(f"    Resume:       {out_path.name}")
+                resumes_done += 1
+            except Exception as e:
+                print(f"    [Resume error]: {e}")
+            cover = generate_cover_letter(jd_text, title, company)
+            if cover:
+                ws.update_cell(sheet_row, COL_COVER_LETTER + 1, cover)
+                print(f"    Cover letter: written to sheet")
+                covers_done += 1
+            time.sleep(0.5)
 
-        try:
-            create_resume(out_path, headline, summary, bullets)
-            filename = out_path.name
-            ws.update_cell(sheet_row, COL_RESUME_CREATED + 1, filename)
-            print(f"    Saved: {filename}")
-            count += 1
-        except Exception as e:
-            print(f"    [Error generating resume]: {e}")
-        time.sleep(0.5)
+    if cover_pending:
+        print(f"\n  Writing cover letters for {len(cover_pending)} listing(s)...")
+        for sheet_row, row in cover_pending:
+            title   = row[2] if len(row) > 2 else ""
+            company = row[3] if len(row) > 3 else ""
+            link    = row[COL_LINK] if len(row) > COL_LINK else ""
+            print(f"  → {title} at {company}")
+            jd_text = fetch_jd_text(link)
+            cover   = generate_cover_letter(jd_text, title, company)
+            if cover:
+                ws.update_cell(sheet_row, COL_COVER_LETTER + 1, cover)
+                print(f"    Cover letter: written to sheet")
+                covers_done += 1
+            time.sleep(0.5)
 
-    return count
+    return resumes_done, covers_done
 
 
 # ── Cover letter generation & application launcher ────────────────────────────
@@ -395,92 +411,6 @@ Rules: Strong operational verbs only. Zero filler phrases ("I am passionate abou
     except Exception as e:
         print(f"    [Cover letter generation failed]: {e}")
         return ""
-
-
-def apply_pending_jobs(ws, sh):
-    """Interactive launcher: for each job with a resume but not yet applied,
-    generate a cover letter, open the job URL, copy resume path to clipboard,
-    then mark Applied + Date Applied on confirmation."""
-    rows = ws.get_all_values()
-    pending = []
-    for i, row in enumerate(rows[1:], start=2):
-        resume_created = row[COL_RESUME_CREATED] if len(row) > COL_RESUME_CREATED else ""
-        applied        = str(row[COL_APPLIED]).upper() if len(row) > COL_APPLIED else ""
-        if resume_created.strip() and applied not in ("TRUE",):
-            pending.append((i, row))
-
-    if not pending:
-        print("  No pending applications (all reviewed jobs already applied or no resumes generated yet).")
-        return 0
-
-    print(f"\n  {len(pending)} job(s) queued for application.\n")
-    count = 0
-    for sheet_row, row in pending:
-        title   = row[2]   if len(row) > 2              else ""
-        company = row[3]   if len(row) > 3              else ""
-        link    = row[COL_LINK] if len(row) > COL_LINK  else ""
-        resume_file = row[COL_RESUME_CREATED]
-        resume_path = TAILORED_DIR / resume_file
-
-        print(f"  ┌─ {title} @ {company}")
-        print(f"  │  Resume: {resume_file}")
-
-        # Cover letter — generate if not already stored
-        cover = row[COL_COVER_LETTER].strip() if len(row) > COL_COVER_LETTER else ""
-        if not cover:
-            print("  │  Generating cover letter...", end=" ", flush=True)
-            jd_text = fetch_jd_text(link)
-            cover   = generate_cover_letter(jd_text, title, company)
-            if cover:
-                ws.update_cell(sheet_row, COL_COVER_LETTER + 1, cover)
-                print("done.")
-            else:
-                print("skipped (API unavailable).")
-        else:
-            print("  │  Cover letter: already on file.")
-
-        # Print cover letter preview
-        if cover:
-            preview = cover[:300] + ("…" if len(cover) > 300 else "")
-            print(f"  │\n  │  {preview.replace(chr(10), chr(10) + '  │  ')}\n  │")
-
-        # Copy resume path to clipboard
-        if _CLIPBOARD:
-            try:
-                pyperclip.copy(str(resume_path))
-                print(f"  │  Clipboard: resume path copied.")
-            except Exception:
-                print(f"  │  Clipboard unavailable — path: {resume_path}")
-        else:
-            print(f"  │  Resume path: {resume_path}")
-
-        # Open job URL in Chrome
-        if link:
-            try:
-                subprocess.Popen(f'start chrome "{link}"', shell=True)
-            except Exception:
-                webbrowser.open(link)
-            print(f"  │  Opened job URL in Chrome.")
-
-        # Confirm
-        try:
-            answer = input("  └─ Mark as applied? [y / n / q=quit] → ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            break
-
-        if answer == "q":
-            break
-        elif answer == "y":
-            today = dt.date.today().isoformat()
-            ws.update_cell(sheet_row, COL_APPLIED + 1,      True)
-            ws.update_cell(sheet_row, COL_DATE_APPLIED + 1, today)
-            print(f"  ✓  Applied — recorded {today}\n")
-            count += 1
-        else:
-            print("  –  Skipped.\n")
-
-    return count
 
 
 # ── Job scrapers ──────────────────────────────────────────────────────────────
@@ -607,29 +537,10 @@ def remoteok_search():
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Job search pipeline — Mark Izrailev")
-    parser.add_argument(
-        "--apply", action="store_true",
-        help="Skip scraping; launch interactive application workflow for reviewed jobs with resumes.",
-    )
-    args = parser.parse_args()
-
     print(f"\n{'='*62}")
     print("  JOB SEARCH — Mark Izrailev  |  Supply Chain / Demand Planning")
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"{'='*62}\n")
-
-    if args.apply:
-        print("  Mode: Application Launcher\n")
-        client  = get_gspread_client()
-        sh      = get_or_create_sheet(client)
-        ws      = init_worksheet(sh)
-        applied = apply_pending_jobs(ws, sh)
-        print(f"\n{'='*62}")
-        print(f"  Applications recorded this session: {applied}")
-        print(f"  Sheet: {sh.url}")
-        print(f"{'='*62}\n")
-        return
 
     # ── Scrape ─────────────────────────────────────────────────────────────
     all_jobs   = []
@@ -685,12 +596,12 @@ def main():
     client   = get_gspread_client()
     sh       = get_or_create_sheet(client)
     ws       = init_worksheet(sh)
-    added    = push_to_sheet(ws, sh, all_jobs)
-    resumes  = generate_pending_resumes(ws, sh)
+    added             = push_to_sheet(ws, sh, all_jobs)
+    resumes, covers   = generate_pending_resumes(ws, sh)
 
     # ── Summary ─────────────────────────────────────────────────────────────
     print(f"\n{'='*62}")
-    print(f"  Scraped: {len(all_jobs)} listings  |  New rows added: {added}  |  Resumes generated: {resumes}")
+    print(f"  Scraped: {len(all_jobs)} listings  |  New: {added}  |  Resumes: {resumes}  |  Cover letters: {covers}")
     print(f"  Sheet:   {sh.url}")
     print(f"{'='*62}\n")
 
