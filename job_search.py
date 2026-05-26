@@ -16,7 +16,7 @@ Output:  Google Sheets spreadsheet  (new rows only — preserves existing Status
 ────────────────────────────────────────────────────────────────────────────────
 """
 
-import requests, json, re, time, sys, os, webbrowser, argparse
+import requests, json, re, time, sys, os, webbrowser, argparse, subprocess
 import datetime as dt
 from datetime import datetime
 from pathlib import Path
@@ -454,10 +454,13 @@ def apply_pending_jobs(ws, sh):
         else:
             print(f"  │  Resume path: {resume_path}")
 
-        # Open job URL
+        # Open job URL in Chrome
         if link:
-            webbrowser.open(link)
-            print(f"  │  Opened job URL in browser.")
+            try:
+                subprocess.Popen(f'start chrome "{link}"', shell=True)
+            except Exception:
+                webbrowser.open(link)
+            print(f"  │  Opened job URL in Chrome.")
 
         # Confirm
         try:
